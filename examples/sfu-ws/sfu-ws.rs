@@ -29,7 +29,9 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
@@ -42,24 +44,6 @@ struct AppState {
     api: API,
     peer_set: Mutex<HashMap<String, Arc<RTCPeerConnection>>>,
     local_tracks: Mutex<HashMap<String, Arc<TrackLocalStaticRTP>>>,
-}
-
-macro_rules! defer {
-    {$($body:stmt;)+} => {
-        let _guard = {
-            pub struct Guard<F: FnOnce()>(Option<F>);
-            impl<F: FnOnce()> Drop for Guard<F> {
-                fn drop(&mut self) {
-                    if let Some(f) = (self.0).take() {
-                        f()
-                    }
-                }
-            }
-            Guard(Some(||{
-                $($body)+
-            }))
-        };
-    };
 }
 
 #[tokio::main]
@@ -125,11 +109,20 @@ async fn main() -> Result<()> {
                             for receiver in receivers {
                                 let track = receiver.track().await;
                                 if let Some(track) = track {
+                                    if track.kind() == RTPCodecType::Video {
                                     let media_ssrc = track.ssrc();
-                                    pc.write_rtcp(&[Box::new(PictureLossIndication{
+                                    if let Err(err) = pc.write_rtcp(&[Box::new(PictureLossIndication{
                                         sender_ssrc: 0,
                                         media_ssrc,
-                                    })]).await;
+                                    })]).await {
+                                        if Error::ErrClosedPipe != err {
+                                            print!("track write_rtcp got error: {} and break", err);
+                                            break;
+                                        } else {
+                                            print!("track write_rtcp got error: {}", err);
+                                        }
+                                    }
+                                }
                                 }
                             }
                         });
@@ -169,12 +162,24 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let peer_id = &format!("pc-{}", rand::random::<u32>());
     let pc = Arc::new(state.api.new_peer_connection(config).await.unwrap());
     let state_clone = state.clone();
+
+    /*
+    // Accept one audio and one video track incoming
+    for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+        if _, err := peerConnection.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
+            Direction: webrtc.RTPTransceiverDirectionRecvonly,
+        }); err != nil {
+            log.Print(err)
+            return
+        }
+    }
+    */
     pc.on_track(Box::new(
         move |track: Option<Arc<TrackRemote>>, _receiver: Option<Arc<RTCRtpReceiver>>| {
             if let Some(track) = track {
-                let state_clone = state.clone();
                 println!("add track");
-                add_track(state_clone, track);
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(add_track(state.clone(), track));
             }
             Box::pin(async {})
         },
@@ -209,8 +214,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     let pc = state_clone.peer_set.lock().unwrap().remove(peer_id);
+
     println!("pc.close");
-    pc.unwrap().close().await;
+    if let Err(err) = pc.unwrap().close().await {
+        print!("pc.close got error: {}", err);
+    }
 }
 
 async fn add_track(state: Arc<AppState>, remote_track: Arc<TrackRemote>) {
@@ -221,12 +229,12 @@ async fn add_track(state: Arc<AppState>, remote_track: Arc<TrackRemote>) {
         track_id.clone(),
         stream_id,
     ));
+
     state
         .local_tracks
         .lock()
         .unwrap()
         .insert(track_id.clone(), local_track.clone());
-
 
     // Read RTP packets being sent to webrtc-rs
     while let Ok((rtp, _)) = remote_track.read_rtp().await {
